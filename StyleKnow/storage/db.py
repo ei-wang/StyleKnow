@@ -81,11 +81,11 @@ class ClothingItem:
 # ========== 内存数据库实现 ==========
 class InMemoryWardrobeDB(BaseWardrobeDB):
     """内存版衣柜数据库，继承自 BaseWardrobeDB"""
-    
+
     def __init__(self):
         self.items: Dict[str, Dict] = {}  # item_id -> item data
-        self.preference_vectors: Dict[str, np.ndarray] = {}  # scene -> vector
         self.user_preferences: Dict[str, Dict] = {}  # user_id -> preferences
+        self.user_preference_vectors: Dict[str, Dict[str, np.ndarray]] = {}  # user_id -> {pref_type -> vector}
         print("[DB] InMemoryWardrobeDB 初始化完成")
     
     # ========== 基础 CRUD ==========
@@ -464,14 +464,8 @@ class InMemoryWardrobeDB(BaseWardrobeDB):
             print(f"[DB] 品类'{category}'检索: 关键词={keywords}, 方法={method}, 匹配{len(scored_results)}件, top={top_k}")
         
         return scored_results[:top_k]
-    
-    # ========== 场景偏好 ==========
-    def set_preference_vector(self, scene: str, vector: List[float]) -> None:
-        """设置场景偏好向量"""
-        vec = np.array(vector, dtype=np.float32)
-        vec = vec / np.linalg.norm(vec)
-        self.preference_vectors[scene] = vec
-    
+
+    # ========== 场景检索 ==========
     def search_by_scene(
         self,
         scene: str,
@@ -489,77 +483,558 @@ class InMemoryWardrobeDB(BaseWardrobeDB):
         Returns:
             相似衣物列表
         """
-        if scene not in self.preference_vectors:
-            print(f"[DB] 警告：场景 '{scene}' 无偏好向量，使用随机检索")
-            # 返回随机结果
-            items = list(self.items.values())
-            if category:
-                items = [i for i in items if i["basic_info"]["category"] == category]
-            np.random.shuffle(items)
-            return [{"item_id": i["id"], "item": i, "similarity": 0.0} for i in items[:top_k]]
+        # 场景到标签的映射
+        scene_tags = {
+            "通勤": ["通勤", "简约", "商务", "正式", "衬衫", "西装裤", "乐福鞋"],
+            "日常": ["日常", "休闲", "舒适", "T恤", "牛仔裤", "运动鞋"],
+            "约会": ["约会", "甜美", "浪漫", "连衣裙", "半身裙", "高跟鞋"],
+            "运动": ["运动", "健身", "跑步", "运动服", "运动裤", "运动鞋"],
+            "度假": ["度假", "海滩", "宽松", "连衣裙", "短裤", "凉鞋"],
+        }
         
-        return self.search_by_vector(
-            query_vector=self.preference_vectors[scene].tolist(),
-            top_k=top_k,
-            category=category
+        # 获取场景对应的关键词
+        keywords = scene_tags.get(scene, [scene])
+        
+        # 如果没有指定品类，使用向量检索
+        if category:
+            return self.search_by_category_and_keywords(
+                category=category,
+                keywords=keywords,
+                top_k=top_k,
+                use_vector=True
+            )
+        
+        # 否则使用标签检索
+        return self.search_by_tags(keywords, top_k=top_k)
+
+    # ========== 并行批量检索 ==========
+    def search_batch(
+        self,
+        search_requests: List[Dict],
+        user_id: str = "default_user"
+    ) -> Dict[str, List[Dict]]:
+        """
+        并行批量检索多个品类
+
+        使用场景：
+        - 用户需求一套完整穿搭（上衣+裤子+鞋子）
+        - 需要同时检索多个品类
+
+        Args:
+            search_requests: 检索请求列表，每个元素包含：
+                - category: 品类
+                - keywords: 关键词列表
+                - top_k: 返回数量
+                - scene: 场景（可选，用于偏好过滤）
+            user_id: 用户ID（用于偏好过滤）
+
+        Returns:
+            字典，key 为品类，value 为检索结果列表：
+            {
+                "上衣": [...],
+                "裤子": [...],
+                "鞋子": [...]
+            }
+
+        Examples:
+            >>> db.search_batch([
+            >>>     {"category": "上衣", "keywords": ["通勤", "简约"], "top_k": 3},
+            >>>     {"category": "裤子", "keywords": ["通勤", "简约"], "top_k": 2},
+            >>>     {"category": "鞋子", "keywords": ["通勤", "简约"], "top_k": 2},
+            >>> ])
+        """
+        import concurrent.futures
+        import threading
+
+        results = {}
+        errors = {}
+
+        def _search_single(request: Dict) -> tuple:
+            """执行单次检索"""
+            category = request.get("category", "")
+            keywords = request.get("keywords", [])
+            top_k = request.get("top_k", 3)
+            scene = request.get("scene")
+            styles = request.get("styles")
+
+            try:
+                if styles:
+                    # 使用 LLM 提供的风格关键词检索（优先）
+                    search_results = self.search_by_styles_with_user_pref(
+                        styles=styles,
+                        user_id=user_id,
+                        top_k=top_k,
+                        category=category
+                    )
+                elif scene:
+                    # 使用场景偏好检索（兼容旧逻辑）
+                    search_results = self.search_by_scene_with_user_pref(
+                        scene=scene,
+                        user_id=user_id,
+                        top_k=top_k,
+                        category=category
+                    )
+                else:
+                    # 使用普通关键词检索
+                    search_results = self.search_by_category_and_keywords(
+                        category=category,
+                        keywords=keywords,
+                        top_k=top_k,
+                        use_vector=False  # 并行时关闭向量，节省时间
+                    )
+
+                return (category, search_results)
+            except Exception as e:
+                return (category, {"error": str(e)})
+
+        # 并行执行所有检索
+        print(f"[DB] 开始并行检索 {len(search_requests)} 个品类...")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(search_requests), 8)) as executor:
+            future_to_category = {
+                executor.submit(_search_single, req): req.get("category")
+                for req in search_requests
+            }
+
+            for future in concurrent.futures.as_completed(future_to_category):
+                category, result = future.result()
+                results[category] = result
+                if "error" in result:
+                    errors[category] = result.get("error")
+
+        # 打印结果摘要
+        success_count = len(results) - len(errors)
+        print(f"[DB] 并行检索完成: 成功 {success_count}/{len(search_requests)}")
+
+        if errors:
+            print(f"[DB] 失败品类: {errors}")
+
+        return results
+
+    # ========== 用户偏好向量管理 ==========
+    def set_preference_vector(self, user_id: str, pref_type: str, vector: List[float]) -> None:
+        """
+        设置用户偏好向量
+
+        Args:
+            user_id: 用户ID
+            pref_type: 偏好类型 (style_color: 风格颜色偏好, fit: 版型偏好)
+            vector: 偏好向量
+        """
+        if not hasattr(self, 'user_preference_vectors'):
+            self.user_preference_vectors = {}
+
+        if user_id not in self.user_preference_vectors:
+            self.user_preference_vectors[user_id] = {}
+
+        vec = np.array(vector, dtype=np.float32)
+        vec = vec / np.linalg.norm(vec) if np.linalg.norm(vec) > 0 else vec
+        self.user_preference_vectors[user_id][pref_type] = vec
+        print(f"[DB] 设置用户偏好向量: user={user_id}, type={pref_type}")
+
+    def get_preference_vector(self, user_id: str, pref_type: str) -> Optional[np.ndarray]:
+        """获取用户偏好向量"""
+        if not hasattr(self, 'user_preference_vectors'):
+            return None
+        return self.user_preference_vectors.get(user_id, {}).get(pref_type)
+
+    # ========== 场景到风格的映射（仅作为备用兼容） ==========
+    # 注意：新的调用流程应由 LLM 通过 styles 参数直接传递风格关键词
+    # 此映射仅用于兼容旧代码（如 search_by_scene_with_user_pref）
+
+    # ========== 获取默认风格关键词 ==========
+    def get_default_styles(self) -> List[str]:
+        """获取默认风格关键词（当 LLM 未提供风格时使用）"""
+        return ["百搭", "舒适", "简约"]
+
+    def get_styles_by_scene(self, scene: str) -> List[str]:
+        """
+        根据场景获取对应的风格关键词（兼容旧逻辑）
+
+        注意：推荐使用 LLM 动态判断风格，此方法仅用于兼容旧代码。
+        """
+        # 基础风格映射（简化版，用于兜底）
+        base_styles = {
+            "通勤": ["简约", "干练"],
+            "商务": ["正式", "专业"],
+            "休闲": ["舒适", "随性"],
+            "约会": ["浪漫", "甜美"],
+            "度假": ["休闲", "清爽"],
+            "运动": ["运动", "功能"],
+            "聚会": ["时尚", "潮流"],
+            "日常": ["百搭", "简约"],
+        }
+
+        # 直接匹配
+        if scene in base_styles:
+            return base_styles[scene]
+
+        # 模糊匹配
+        for key, styles in base_styles.items():
+            if key in scene or scene in key:
+                return styles
+
+        # 默认返回通用风格
+        return self.get_default_styles()
+
+    def search_by_scene_with_user_pref(
+        self,
+        scene: str,
+        user_id: str = "default_user",
+        top_k: int = 8,
+        category: Optional[str] = None
+    ) -> List[Dict]:
+        """
+        基于场景+用户偏好检索衣物
+
+        检索逻辑：
+        1. 根据场景获取风格关键词
+        2. 获取用户在该场景的偏好
+        3. 过滤掉用户厌恶的标签
+        4. 优先匹配用户喜欢的风格/颜色
+
+        Args:
+            scene: 场景名称 (通勤/商务/休闲/约会/度假/运动/聚会/日常)
+            user_id: 用户ID
+            top_k: 返回数量
+            category: 可选，按品类筛选
+
+        Returns:
+            相似衣物列表
+        """
+        # 1. 获取场景对应的风格关键词
+        scene_styles = self.get_styles_by_scene(scene)
+
+        # 2. 获取用户在该场景的偏好
+        scene_prefs = self.get_scene_preference(user_id, scene)
+        liked_styles = scene_prefs.get("style", "").split(",") if scene_prefs.get("style") else []
+        liked_colors = scene_prefs.get("color", "").split(",") if scene_prefs.get("color") else []
+        avoid_items = scene_prefs.get("avoid", "").split(",") if scene_prefs.get("avoid") else []
+
+        # 清理空白
+        liked_styles = [s.strip() for s in liked_styles if s.strip()]
+        liked_colors = [c.strip() for c in liked_colors if c.strip()]
+        avoid_items = [a.strip() for a in avoid_items if a.strip()]
+
+        print(f"[DB] 场景偏好: scene={scene}, liked_styles={liked_styles}, liked_colors={liked_colors}, avoid={avoid_items}")
+
+        # 3. 组合检索关键词
+        keywords = scene_styles.copy()
+
+        # 添加用户喜欢的风格和颜色
+        if liked_styles:
+            keywords.extend(liked_styles)
+        if liked_colors:
+            keywords.extend(liked_colors)
+
+        # 4. 执行混合检索
+        results = self.search_by_category_and_keywords(
+            category=category if category else "上衣",
+            keywords=keywords,
+            top_k=top_k * 2,  # 多检索一些，后面要过滤
+            use_vector=False  # 先不用向量，用关键词匹配
         )
+
+        # 5. 过滤和排序
+        filtered_results = []
+        for r in results:
+            item = r["item"]
+            item_tags = set(item.get("semantic_tags", []))
+            metadata = item.get("dynamic_metadata", {})
+            item_color = metadata.get("color", "")
+            item_style = metadata.get("style_vibe", "")
+
+            # 检查是否包含用户厌恶的标签
+            should_filter = False
+            for avoid in avoid_items:
+                if avoid in item_tags or avoid in item_color or avoid in item_style:
+                    should_filter = True
+                    break
+
+            if should_filter:
+                continue
+
+            # 计算偏好匹配分数
+            pref_score = 0.0
+
+            # 风格匹配
+            for style in liked_styles:
+                if style in item_tags or style in item_style:
+                    pref_score += 0.5
+                    break
+
+            # 颜色匹配
+            for color in liked_colors:
+                if color in item_tags or color in item_color:
+                    pref_score += 0.5
+                    break
+
+            # 综合分数 = 原分数 + 偏好分数
+            final_score = r["similarity"] + pref_score * 0.3
+
+            filtered_results.append({
+                **r,
+                "similarity": final_score,
+                "pref_score": pref_score
+            })
+
+        # 排序
+        filtered_results.sort(key=lambda x: x["similarity"], reverse=True)
+
+        # 返回 top_k
+        print(f"[DB] 场景检索: scene='{scene}', 原始{len(results)}条, 过滤后{len(filtered_results)}条, 返回{top_k}条")
+
+        return filtered_results[:top_k]
+
+    def search_by_styles_with_user_pref(
+        self,
+        styles: List[str],
+        user_id: str = "default_user",
+        top_k: int = 8,
+        category: Optional[str] = None,
+        scene: Optional[str] = None
+    ) -> List[Dict]:
+        """
+        基于风格关键词+用户偏好检索衣物（由 LLM 动态判断风格）
+
+        检索逻辑：
+        1. 直接使用 LLM 提供的风格关键词
+        2. 获取用户的偏好信息
+        3. 过滤掉用户厌恶的标签
+        4. 优先匹配用户喜欢的风格/颜色
+
+        Args:
+            styles: LLM 动态判断的风格关键词列表，如 ["简约", "干练", "商务"]
+            user_id: 用户ID
+            top_k: 返回数量
+            category: 可选，按品类筛选
+            scene: 可选，场景名称（用于获取用户在该场景的偏好）
+
+        Returns:
+            相似衣物列表
+        """
+        # 1. 获取用户偏好（使用 scene 或默认场景）
+        scene_prefs = self.get_scene_preference(user_id, scene)
+
+        liked_styles = scene_prefs.get("style", "").split(",") if scene_prefs.get("style") else []
+        liked_colors = scene_prefs.get("color", "").split(",") if scene_prefs.get("color") else []
+        avoid_items = scene_prefs.get("avoid", "").split(",") if scene_prefs.get("avoid") else []
+
+        # 清理空白
+        liked_styles = [s.strip() for s in liked_styles if s.strip()]
+        liked_colors = [c.strip() for c in liked_colors if c.strip()]
+        avoid_items = [a.strip() for a in avoid_items if a.strip()]
+
+        print(f"[DB] 风格检索: styles={styles}, scene={scene}, liked_styles={liked_styles}, liked_colors={liked_colors}, avoid={avoid_items}")
+
+        # 2. 组合检索关键词
+        keywords = styles.copy()
+
+        # 添加用户喜欢的风格和颜色
+        if liked_styles:
+            keywords.extend(liked_styles)
+        if liked_colors:
+            keywords.extend(liked_colors)
+
+        # 3. 执行混合检索
+        results = self.search_by_category_and_keywords(
+            category=category if category else "上衣",
+            keywords=keywords,
+            top_k=top_k * 2,  # 多检索一些，后面要过滤
+            use_vector=False  # 先不用向量，用关键词匹配
+        )
+
+        # 4. 过滤和排序
+        filtered_results = []
+        for r in results:
+            item = r["item"]
+            item_tags = set(item.get("semantic_tags", []))
+            metadata = item.get("dynamic_metadata", {})
+            item_color = metadata.get("color", "")
+            item_style = metadata.get("style_vibe", "")
+
+            # 检查是否包含用户厌恶的标签
+            should_filter = False
+            for avoid in avoid_items:
+                if avoid in item_tags or avoid in item_color or avoid in item_style:
+                    should_filter = True
+                    break
+
+            if should_filter:
+                continue
+
+            # 计算偏好匹配分数
+            pref_score = 0.0
+
+            # 风格匹配
+            for style in liked_styles:
+                if style in item_tags or style in item_style:
+                    pref_score += 0.5
+                    break
+
+            # 颜色匹配
+            for color in liked_colors:
+                if color in item_tags or color in item_color:
+                    pref_score += 0.5
+                    break
+
+            # 综合分数 = 原分数 + 偏好分数
+            final_score = r["similarity"] + pref_score * 0.3
+
+            filtered_results.append({
+                **r,
+                "similarity": final_score,
+                "pref_score": pref_score
+            })
+
+        # 排序
+        filtered_results.sort(key=lambda x: x["similarity"], reverse=True)
+
+        # 返回 top_k
+        print(f"[DB] 风格检索: styles={styles}, 原始{len(results)}条, 过滤后{len(filtered_results)}条, 返回{top_k}条")
+
+        return filtered_results[:top_k]
     
     # ========== 统计 ==========
     def get_stats(self) -> Dict:
         """获取统计信息"""
         by_category = {}
         by_tag = {}
-        
+
         for item in self.items.values():
             # 按品类统计
             cat = item["basic_info"]["category"]
             by_category[cat] = by_category.get(cat, 0) + 1
-            
+
             # 按标签统计
             for tag in item["semantic_tags"]:
                 by_tag[tag] = by_tag.get(tag, 0) + 1
-        
+
         return {
             "total_items": len(self.items),
             "by_category": by_category,
             "by_tag": by_tag,
-            "scenes": list(self.preference_vectors.keys())
+            "scenes": ["通勤", "商务", "休闲", "约会", "度假", "运动", "聚会", "日常"]
         }
     
     # ========== 用户偏好管理 (实现抽象方法) ==========
-    def update_user_preference(self, user_id: str, prefs: Dict[str, Any]) -> bool:
+    # 新版偏好结构：{user_id: {default_scene: str, scenes: {scene: {key: value}}}}
+
+    def update_user_preference(
+        self,
+        user_id: str,
+        prefs: Dict[str, Any],
+        scene: str = None
+    ) -> bool:
         """
-        更新用户偏好
-        
+        更新用户偏好（支持场景化）
+
+        新结构：
+        {
+            "default_scene": "通勤",
+            "scenes": {
+                "通勤": {"style": "简约", "color": "蓝色", "avoid": "过于正式"},
+                "约会": {"style": "甜美", "color": "粉色"}
+            }
+        }
+
         Args:
             user_id: 用户 ID
-            prefs: 偏好字典
-        
+            prefs: 偏好字典，如 {"style": "简约", "color": "蓝色"}
+            scene: 可选，指定场景。如果不指定，更新默认场景的偏好。
+
         Returns:
             是否更新成功
         """
         try:
             if user_id not in self.user_preferences:
-                self.user_preferences[user_id] = {}
-            
-            self.user_preferences[user_id].update(prefs)
-            print(f"[DB] 更新用户偏好: user_id={user_id}, prefs={prefs}")
+                self.user_preferences[user_id] = {
+                    "default_scene": "日常",
+                    "scenes": {}
+                }
+
+            user_prefs = self.user_preferences[user_id]
+
+            # 如果没有指定场景，使用默认场景
+            target_scene = scene or user_prefs.get("default_scene", "日常")
+
+            # 确保 scenes 结构存在
+            if "scenes" not in user_prefs:
+                user_prefs["scenes"] = {}
+
+            # 初始化场景偏好（如果不存在）
+            if target_scene not in user_prefs["scenes"]:
+                user_prefs["scenes"][target_scene] = {}
+
+            # 更新该场景的偏好
+            user_prefs["scenes"][target_scene].update(prefs)
+
+            print(f"[DB] 更新用户偏好: user={user_id}, scene={target_scene}, prefs={prefs}")
             return True
         except Exception as e:
             print(f"[DB] 更新用户偏好失败: {e}")
             return False
-    
+
     def get_user_preference(self, user_id: str) -> Dict[str, Any]:
         """
-        获取用户偏好
-        
+        获取用户完整偏好
+
         Args:
             user_id: 用户 ID
-        
+
         Returns:
-            用户偏好字典
+            用户偏好字典（包含 default_scene 和 scenes）
         """
-        return self.user_preferences.get(user_id, {})
+        return self.user_preferences.get(user_id, {
+            "default_scene": "日常",
+            "scenes": {}
+        })
+
+    def get_scene_preference(
+        self,
+        user_id: str,
+        scene: str = None
+    ) -> Dict[str, Any]:
+        """
+        获取特定场景的偏好
+
+        Args:
+            user_id: 用户 ID
+            scene: 场景名称。如果不指定，使用默认场景。
+
+        Returns:
+            场景偏好字典，如 {"style": "简约", "color": "蓝色", "avoid": "过于正式"}
+        """
+        user_prefs = self.get_user_preference(user_id)
+        target_scene = scene or user_prefs.get("default_scene", "日常")
+
+        return user_prefs.get("scenes", {}).get(target_scene, {})
+
+    def set_default_scene(self, user_id: str, scene: str) -> bool:
+        """
+        设置用户的默认场景
+
+        Args:
+            user_id: 用户 ID
+            scene: 场景名称
+
+        Returns:
+            是否设置成功
+        """
+        try:
+            if user_id not in self.user_preferences:
+                self.user_preferences[user_id] = {
+                    "default_scene": scene,
+                    "scenes": {}
+                }
+            else:
+                self.user_preferences[user_id]["default_scene"] = scene
+
+            print(f"[DB] 设置默认场景: user={user_id}, scene={scene}")
+            return True
+        except Exception as e:
+            print(f"[DB] 设置默认场景失败: {e}")
+            return False
     
     # ========== 混合检索 (实现抽象方法) ==========
     def search_hybrid(
@@ -632,7 +1107,7 @@ class InMemoryWardrobeDB(BaseWardrobeDB):
     def mock(self) -> None:
         """生成测试数据"""
         print("\n[DB] 开始生成 Mock 测试数据...")
-        
+
         mock_items = [
             {
                 "basic_info": {
@@ -678,32 +1153,29 @@ class InMemoryWardrobeDB(BaseWardrobeDB):
                 }
             }
         ]
-        
+
         for item_data in mock_items:
             # 生成向量
             if not item_data.get("vector_embedding"):
                 item_data["vector_embedding"] = self._generate_random_vector()
             self.add_item(item_data)
-        
-        # 设置场景偏好向量
-        self.preference_vectors["commute"] = np.random.randn(128).astype(np.float32)
-        self.preference_vectors["commute"] /= np.linalg.norm(self.preference_vectors["commute"])
-        
-        self.preference_vectors["vacation"] = np.random.randn(128).astype(np.float32)
-        self.preference_vectors["vacation"] /= np.linalg.norm(self.preference_vectors["vacation"])
-        
+
+        # 初始化用户偏好向量存储
+        if not hasattr(self, 'user_preference_vectors'):
+            self.user_preference_vectors = {}
+
         print(f"[DB] 已生成 {len(self.items)} 件测试衣物")
 
 
 # ========== 持久化存储（可选）==========
 class FileWardrobeDB(InMemoryWardrobeDB):
     """文件持久化衣柜数据库"""
-    
+
     def __init__(self, storage_path: str = "storage/wardrobe_data.json"):
         super().__init__()
         self.storage_path = Path(storage_path)
         self._load()
-    
+
     def _load(self) -> None:
         """从文件加载数据"""
         if self.storage_path.exists():
@@ -711,35 +1183,39 @@ class FileWardrobeDB(InMemoryWardrobeDB):
                 with open(self.storage_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.items = data.get("items", {})
-                    
-                    # 加载偏好向量
-                    vectors = data.get("preference_vectors", {})
-                    self.preference_vectors = {
-                        k: np.array(v) for k, v in vectors.items()
+
+                    # 加载用户偏好向量 (新版)
+                    user_vectors = data.get("user_preference_vectors", {})
+                    self.user_preference_vectors = {
+                        uid: {k: np.array(v) for k, v in prefs.items()}
+                        for uid, prefs in user_vectors.items()
                     }
-                    
+
                     print(f"[DB] 已从文件加载 {len(self.items)} 件衣物")
             except Exception as e:
                 print(f"[DB] 加载数据失败: {e}")
-    
+
     def save(self) -> None:
         """保存数据到文件"""
         # 确保目录存在
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 转换向量为列表
-        vectors = {
-            k: v.tolist() for k, v in self.preference_vectors.items()
-        }
-        
+
+        # 转换用户偏好向量为列表 (新版)
+        user_vectors = {}
+        if hasattr(self, 'user_preference_vectors'):
+            user_vectors = {
+                uid: {k: v.tolist() for k, v in prefs.items()}
+                for uid, prefs in self.user_preference_vectors.items()
+            }
+
         data = {
             "items": self.items,
-            "preference_vectors": vectors
+            "user_preference_vectors": user_vectors
         }
-        
+
         with open(self.storage_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        
+
         print(f"[DB] 已保存 {len(self.items)} 件衣物到文件")
 
 

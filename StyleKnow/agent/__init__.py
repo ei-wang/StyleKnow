@@ -15,18 +15,11 @@ LangGraph 工作流组件
 使用示例：
 ```python
 from agent.graph import run_workflow
-from agent.tools import update_user_preference
+from agent.tools import update_preference_tool
 
 # 运行工作流
-result = run_workflow("明天去公司开会，帮我搭配")
-print(result["final_outfit"])
-
-# 用户点赞后更新偏好
-update_user_preference(
-    scene="commute",
-    outfit_items=result["retrieved_items"],
-    is_like=True
-)
+result = run_workflow("明天去公司开会，帮我搭配", user_id="user_001")
+print(result["final_response"])
 ```
 """
 
@@ -35,68 +28,90 @@ from agent.state import GraphState
 
 # Nodes
 from agent.nodes import (
-    recognize_intent_node,
-    generate_search_tasks_node,
-    retrieve_web_node,
-    process_xhs_results_node,
-    retrieve_wardrobe_node,
-    generate_outfit_node,
-    critic_evaluate_node
+    router_node,
+    direct_action_node,
+    stylist_agent_node,
+    critic_agent_node
 )
 
 # Edges
-from agent.edges import should_continue
+from agent.edges import (
+    route_after_router,
+    route_after_stylist,
+    route_after_critic
+)
 
 # Graph
 from agent.graph import build_workflow, run_workflow
 
-# Tools (from ultis.py)
+# Tools
+from agent.tools import (
+    search_xhs_tool,
+    search_wardrobe_tool,
+    update_preference_tool,
+    get_user_preference_tool,
+    AGENT_TOOLS
+)
+
+# Utils
 from agent.ultis import (
     get_llm,
     init_wardrobe_db,
     get_wardrobe_db,
     update_user_preference,
     parse_llm_json_response,
-    clean_xhs_response as _clean_xhs_response
+    clean_xhs_response
 )
 
 # Prompts
 from agent.prompts import (
     build_generate_prompt,
     build_critic_system_prompt,
-    build_critic_human_prompt
+    build_critic_human_prompt,
+    IntentType,
+    RouterOutput,
+    CriticOutput
 )
 
 __all__ = [
     # State
     "GraphState",
-    
+
     # Nodes
-    "recognize_intent_node",
-    "generate_search_tasks_node",
-    "retrieve_web_node",
-    "process_xhs_results_node",
-    "retrieve_wardrobe_node",
-    "generate_outfit_node",
-    "critic_evaluate_node",
-    
+    "router_node",
+    "direct_action_node",
+    "stylist_agent_node",
+    "critic_agent_node",
+
     # Edges
-    "should_continue",
-    
+    "route_after_router",
+    "route_after_stylist",
+    "route_after_critic",
+
     # Graph
     "build_workflow",
     "run_workflow",
-    
+
     # Tools
+    "search_xhs_tool",
+    "search_wardrobe_tool",
+    "update_preference_tool",
+    "get_user_preference_tool",
+    "AGENT_TOOLS",
+
+    # Utils
     "get_llm",
     "init_wardrobe_db",
     "get_wardrobe_db",
     "update_user_preference",
     "parse_llm_json_response",
     "clean_xhs_response",
-    
+
     # Prompts
     "build_generate_prompt",
     "build_critic_system_prompt",
     "build_critic_human_prompt",
+    "IntentType",
+    "RouterOutput",
+    "CriticOutput",
 ]

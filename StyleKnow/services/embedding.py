@@ -20,7 +20,7 @@ import base64
 import os
 from typing import List, Optional, Union
 
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from http import HTTPStatus
 
 from storage.config_store import load_config
@@ -310,3 +310,114 @@ def search_by_vector(
 
     similarities.sort(key=lambda x: x[1], reverse=True)
     return similarities[:top_k]
+
+
+# ========== 异步版本 (使用 httpx 调用 dashscope OpenAI 兼容 API) ==========
+async def embed_text_async(
+    text: str,
+    model: Optional[str] = None,
+    dimensions: Optional[int] = None
+) -> List[float]:
+    """
+    异步版本：将文本向量化
+
+    Args:
+        text: 输入文本
+        model: embedding 模型名称（推荐: text-embedding-v3）
+        dimensions: 向量维度
+
+    Returns:
+        向量列表
+    """
+    import httpx
+    from storage.config_store import load_config
+
+    config = load_config()
+    embedding_model = model or config.embedding_model
+
+    # 使用 OpenAI 兼容模式的 URL
+    base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    url = f"{base_url}/embeddings"
+
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": embedding_model,
+        "input": text
+    }
+    if dimensions:
+        payload["dimensions"] = dimensions
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            if "data" in data and len(data["data"]) > 0:
+                return data["data"][0]["embedding"]
+            else:
+                raise RuntimeError(f"文本向量化失败(异步): 无效响应格式")
+
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(f"文本向量化失败(异步) HTTP {e.response.status_code}: {e.response.text}")
+    except Exception as e:
+        raise RuntimeError(f"文本向量化失败(异步): {e}") from e
+
+
+async def embed_texts_async(
+    texts: List[str],
+    model: Optional[str] = None,
+    dimensions: Optional[int] = None
+) -> List[List[float]]:
+    """
+    异步版本：批量文本向量化
+
+    Args:
+        texts: 输入文本列表
+        model: embedding 模型名称
+        dimensions: 向量维度
+
+    Returns:
+        向量列表
+    """
+    import httpx
+    from storage.config_store import load_config
+
+    config = load_config()
+    embedding_model = model or config.embedding_model
+
+    # 使用 OpenAI 兼容模式的 URL
+    base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    url = f"{base_url}/embeddings"
+
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": embedding_model,
+        "input": texts
+    }
+    if dimensions:
+        payload["dimensions"] = dimensions
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+
+            if "data" in data:
+                return [item["embedding"] for item in data["data"]]
+            else:
+                raise RuntimeError(f"批量文本向量化失败(异步): 无效响应格式")
+
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(f"批量文本向量化失败(异步) HTTP {e.response.status_code}: {e.response.text}")
+    except Exception as e:
+        raise RuntimeError(f"批量文本向量化失败(异步): {e}") from e

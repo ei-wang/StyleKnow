@@ -62,22 +62,21 @@ async def remove_background_api(
             raise ValueError(f"remove.bg API 调用失败: HTTP {response.status_code}")
 
 
-def get_remaining_credits(api_key: str) -> Optional[int]:
+async def get_remaining_credits(api_key: str) -> Optional[int]:
     """
-    获取 remove.bg API 剩余使用次数
-    
-    Note: 这个信息在响应头中返回，这里提供一个同步版本用于检查
+    获取 remove.bg API 剩余使用次数（异步版本）
     """
-    import requests
-    
+    import httpx
+
     url = "https://api.remove.bg/v1.0/account"
     headers = {"X-API-Key": api_key}
-    
+
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("data", {}).get("attributes", {}).get("credits", {}).get("free", 0)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("data", {}).get("attributes", {}).get("credits", {}).get("free", 0)
     except Exception:
         pass
     return None

@@ -13,7 +13,7 @@ class LLMConfig(BaseModel):
     VLM: str = "qwen3.5-flash"
     # 文本 Embedding 模型（通过 OpenAI 客户端调用）
     # 推荐: text-embedding-v3 (1024维), text-embedding-v4
-    embedding_model: str = "tongyi-embedding-vision-flash"
+    embedding_model: str = "text-embedding-v3"
     
     # 多模态 Embedding 模型（使用 dashscope 原生 SDK）
     # 推荐: tongyi-embedding-vision-plus (支持 dashscope SDK)
@@ -22,9 +22,8 @@ class LLMConfig(BaseModel):
     removebg_api_key: str = "Eg1nnFvx24FaQevcQXfGBewW"
     bg_removal_method: Literal["local", "removebg"] = "removebg"  # 本地 rembg 或 remove.bg API
     # 和风天气 API 配置
-    qweather_api_key: str = "0d69e80c540e43c8bcff72ceaef66c2f"
-    #qweather_api_host: str = "devapi.qweather.com"  # 免费版: devapi.qweather.com | 付费版: api.qweather.com
-    qweather_api_host: str = "api.qweather.com"  # 免费版: devapi.qweather.com | 付费版: api.qweather.com
+    qweather_api_key: str = "b15408cd760841ae882120b138359e87"
+    qweather_api_host: str = "m47jphdc93.re.qweatherapi.com"  # 付费版: m47jphdc93.re.qweatherapi.com
     xhs_api_url: str = "https://api.302.ai/tools/xiaohongshu/app/search_notes"
     xhs_api_key: str = "sk-VEZRFPYodaohpXo1qp6GZI6AOmfrz7hiI4tTzaQKmDnGyzIs"
     

@@ -3,7 +3,7 @@
 工具函数集合
 
 包含：
-- LLM 配置和初始化
+- LLM 配置和初始化（同步 + 异步）
 - 数据库初始化
 - 偏好更新函数
 - JSON 解析工具
@@ -12,8 +12,9 @@
 import os
 import json
 import re
+import asyncio
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -28,22 +29,26 @@ OPENAI_API_KEY: str = _config.api_key or os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL: str = _config.model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_BASE: str = _config.api_base or os.environ.get("OPENAI_API_BASE", "")
 
+# 同步 LLM 实例（用于 embedding 等）
 llm_instance: Optional[ChatOpenAI] = None
+
+# 异步 LLM 实例（用于对话和 Agent）
+async_llm_instance: Optional[ChatOpenAI] = None
 
 
 def get_llm() -> Optional[ChatOpenAI]:
-    """获取或初始化 LLM 实例"""
+    """获取或初始化同步 LLM 实例（用于 embedding 等）"""
     global llm_instance
     if llm_instance is None:
         if not OPENAI_API_KEY:
             print("[WARNING] 未设置 OPENAI_API_KEY，将使用 Mock 模式")
             return None
-        
+
         # 构建 API 基础 URL
         base_url = OPENAI_API_BASE.rstrip("/")
         if not base_url.endswith("/v1"):
             base_url = base_url + "/v1"
-        
+
         llm_instance = ChatOpenAI(
             model=OPENAI_MODEL,
             temperature=0.7,
@@ -51,6 +56,34 @@ def get_llm() -> Optional[ChatOpenAI]:
             base_url=base_url
         )
     return llm_instance
+
+
+def get_async_llm() -> Optional[ChatOpenAI]:
+    """获取或初始化异步 LLM 实例（用于对话和 Agent）
+
+    使用 ChatOpenAI 的 ainvoke 方法实现异步调用。
+    httpx 客户端会复用连接，提升调用速度。
+    """
+    global async_llm_instance
+    if async_llm_instance is None:
+        if not OPENAI_API_KEY:
+            print("[WARNING] 未设置 OPENAI_API_KEY，将使用 Mock 模式")
+            return None
+
+        # 构建 API 基础 URL
+        base_url = OPENAI_API_BASE.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url = base_url + "/v1"
+
+        # 使用 ChatOpenAI，支持 ainvoke 异步调用
+        # 内部使用 httpx.AsyncClient，复用连接
+        async_llm_instance = ChatOpenAI(
+            model=OPENAI_MODEL,
+            temperature=0.7,
+            api_key=OPENAI_API_KEY,
+            base_url=base_url,
+        )
+    return async_llm_instance
 
 
 # ========== 数据库初始化 ==========
@@ -91,6 +124,27 @@ def get_recommended_db() -> RecommendedClothingDB:
     if recommended_db is None:
         recommended_db = RecommendedClothingDB()
     return recommended_db
+
+
+# ========== 用户偏好更新 ==========
+def update_user_preference(
+    user_id: str,
+    prefs: Dict[str, Any],
+    scene: str = None
+) -> bool:
+    """
+    更新用户偏好（支持场景化）
+
+    Args:
+        user_id: 用户 ID
+        prefs: 偏好字典，如 {"style": "简约", "color": "蓝色"}
+        scene: 可选，指定场景。如果不指定，更新默认场景的偏好。
+
+    Returns:
+        是否更新成功
+    """
+    db = get_wardrobe_db()
+    return db.update_user_preference(user_id, prefs, scene=scene)
 
 
 # ========== JSON 解析工具 ==========
@@ -143,83 +197,6 @@ def parse_llm_json_response(response: str) -> str:
         reason_match = re.search(r'"reason":\s*"([^"]*)"', response)
         reason = reason_match.group(1) if reason_match else "搭配存在问题"
         return f"[REJECT] {reason}"
-
-
-# ========== 偏好更新函数 ==========
-def update_user_preference(
-    scene: str,
-    outfit_items: List[dict],
-    is_like: bool
-) -> bool:
-    """
-    用户偏好更新接口（由用户点赞/踩触发）
-    
-    公式: new_vector = 0.9 * old_vector + 0.1 * current_outfit_vector * feedback_sign
-    
-    Args:
-        scene: 场景名称 (commute/vacation/casual/sports)
-        outfit_items: 用户最终选择的搭配物品列表
-        is_like: 用户是否喜欢这套搭配
-    
-    Returns:
-        bool: 更新是否成功
-    """
-    global wardrobe_db
-    if wardrobe_db is None:
-        wardrobe_db = init_wardrobe_db()
-    
-    # 检查场景是否存在偏好向量
-    if scene not in wardrobe_db.preference_vectors:
-        print(f"[WARN] 场景 '{scene}' 无偏好向量，初始化...")
-        wardrobe_db.preference_vectors[scene] = np.random.randn(128).astype(np.float32)
-        wardrobe_db.preference_vectors[scene] = (
-            wardrobe_db.preference_vectors[scene] / 
-            np.linalg.norm(wardrobe_db.preference_vectors[scene])
-        )
-    
-    # 获取旧向量
-    old_vector = wardrobe_db.preference_vectors[scene].copy()
-    
-    # 生成当前搭配的向量（简化：用物品向量的平均）
-    if outfit_items:
-        item_vectors = []
-        for item in outfit_items:
-            item_id = item.get("item_id")
-            # 使用 self.items 而不是 items_collection
-            item_data = wardrobe_db.items.get(item_id)
-            if item_data:
-                item_vec = item_data.get("vector_embedding")
-                if item_vec is not None:
-                    item_vectors.append(np.array(item_vec))
-        
-        if item_vectors:
-            current_outfit_vector = np.mean(item_vectors, axis=0)
-        else:
-            current_outfit_vector = np.random.randn(128).astype(np.float32)
-    else:
-        current_outfit_vector = np.random.randn(128).astype(np.float32)
-    
-    # 归一化
-    if np.linalg.norm(current_outfit_vector) > 0:
-        current_outfit_vector = current_outfit_vector / np.linalg.norm(current_outfit_vector)
-    
-    # 反馈符号
-    feedback_sign = 1.0 if is_like else -1.0
-    
-    # 应用更新公式
-    new_vector = 0.9 * old_vector + 0.1 * current_outfit_vector * feedback_sign
-    
-    # 归一化
-    if np.linalg.norm(new_vector) > 0:
-        new_vector = new_vector / np.linalg.norm(new_vector)
-    
-    # 保存
-    wardrobe_db.preference_vectors[scene] = new_vector
-    
-    print(f"\n[Preference] 偏好已更新: 场景={scene}, is_like={is_like}, feedback_sign={feedback_sign}")
-    print(f"[Preference] 旧向量范数: {np.linalg.norm(old_vector):.4f}, 新向量范数: {np.linalg.norm(new_vector):.4f}")
-    
-    return True
 
 
 def clean_xhs_response(raw_json: dict) -> list[dict]:

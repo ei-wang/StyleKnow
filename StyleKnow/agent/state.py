@@ -34,6 +34,7 @@ class GraphState(TypedDict):
     - current_intent: 当前路由意图
     - draft_outfit: 生成的草稿方案
     - iterations: 反思迭代次数
+    - user_id: 用户 ID（用于多租户隔离）
     """
     
     # 核心对话流 - 使用 add_messages Reducer
@@ -51,6 +52,9 @@ class GraphState(TypedDict):
     
     # 反思迭代次数
     iterations: int
+
+    # 用户 ID（用于多租户隔离）
+    user_id: str
 
 
 # ========== 辅助函数 ==========

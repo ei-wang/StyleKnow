@@ -4,7 +4,6 @@
 
 Agent 可直接调用的天气工具：
 - get_weather_info: 获取指定城市的天气信息
-- get_clothing_suggestion: 根据天气获取穿搭建议
 - search_cities: 搜索城市信息
 
 依赖: services.weather 模块
@@ -20,8 +19,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.weather import (
     get_weather as _get_weather,
-    get_clothing_suggestion as _get_clothing_suggestion,
-    get_season_from_weather as _get_season_from_weather,
     search_city as _search_city,
     WeatherInfo
 )
@@ -101,19 +98,17 @@ def get_weather_with_suggestion(
     city_name: Optional[str] = None
 ) -> Dict:
     """
-    获取天气信息及穿搭建议
+    获取天气信息（穿搭建议由 LLM 根据天气数据生成）
     
     Args:
         location: 位置标识 (同 get_weather_info)
         city_name: 城市名称（可选）
     
     Returns:
-        包含天气和穿搭建议的字典:
+        包含天气信息的字典:
         {
             "success": bool,
             "weather": {...},
-            "seasons": List[str],
-            "suggestion": str,
             "message": str
         }
     
@@ -126,27 +121,9 @@ def get_weather_with_suggestion(
     if not weather_result.get("success"):
         return weather_result
     
-    # 构建 WeatherInfo 对象用于穿搭建议
-    weather_info = WeatherInfo(
-        temperature=weather_result["temperature"],
-        feelsLike=weather_result["feels_like"],
-        condition=weather_result["condition"],
-        icon="",
-        humidity=weather_result["humidity"],
-        windDir=weather_result["wind_dir"],
-        windScale=weather_result["wind_scale"],
-        location=weather_result["location"],
-        obsTime=weather_result.get("obs_time", "")
-    )
-    
-    # 获取穿搭建议
-    suggestion = _get_clothing_suggestion(weather_info)
-    
-    # 获取适合季节
-    seasons = _get_season_from_weather(weather_info)
-    
     return {
         "success": True,
+        "location": weather_result.get("location", location),
         "weather": {
             "temperature": weather_result["temperature"],
             "feels_like": weather_result["feels_like"],
@@ -155,9 +132,7 @@ def get_weather_with_suggestion(
             "wind_dir": weather_result["wind_dir"],
             "wind_scale": weather_result["wind_scale"]
         },
-        "seasons": seasons,
-        "suggestion": suggestion,
-        "message": f"{weather_result['message']}\n{suggestion}"
+        "message": weather_result['message']
     }
 
 
@@ -198,7 +173,9 @@ def search_city_info(query: str, limit: int = 5) -> Dict:
             "id": city.id,
             "province": city.adm1,
             "city": city.adm2,
-            "country": city.country
+            "country": city.country,
+            "lat": city.lat,
+            "lon": city.lon
         }
         for city in cities
     ]

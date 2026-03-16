@@ -155,10 +155,10 @@ async def search_xhs(
     """
     小红书搜索接口
     """
-    from tools.xhs_search import search_xhs_notes
-    
+    from tools.xhs_search import search_xhs_notes_async
+
     try:
-        result = search_xhs_notes(
+        result = await search_xhs_notes_async(
             keyword=keyword,
             page=page,
             sort_type=sort_type

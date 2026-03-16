@@ -13,6 +13,7 @@ LangGraph Agent 节点函数集合
 - 使用 LangGraph 原生的 add_messages Reducer
 - 工具通过 llm.bind_tools() 绑定
 - Pydantic Schema 进行结构化输出
+- 所有 LLM 调用改为异步，使用 AsyncChatOpenAI 持久化连接
 """
 
 import sys
@@ -23,7 +24,7 @@ from typing import List, Dict, Any, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.state import GraphState
-from agent.ultis import get_llm, get_wardrobe_db
+from agent.ultis import get_llm, get_async_llm, get_wardrobe_db
 from agent.prompts import (
     build_intent_recognition_prompt,
     RouterOutput,
@@ -33,6 +34,7 @@ from agent.prompts import (
 from agent.tools import (
     search_xhs_tool,
     search_wardrobe_tool,
+    search_wardrobe_batch_tool,  # 新增：批量并行检索
     update_preference_tool,
     get_user_preference_tool,
 )
@@ -45,84 +47,100 @@ STYLIST_SYSTEM_PROMPT = """你是一位专业的时尚造型师助手。
 
 你的核心任务是：根据用户的需求，从衣柜中挑选合适的衣物，生成个性化的穿搭建议。
 
-【工作流程】
-1. 理解用户需求（场景、风格、天气等）
-2. 必要时调用工具获取信息（天气、小红书灵感、衣柜检索）
-3. 结合用户偏好和可用衣物，生成穿搭建议
-
-【可用工具】
-- search_xhs_tool: 搜索小红书热门穿搭，获取灵感
-- search_wardrobe_tool: 检索用户衣柜中的衣物
-- get_weather_tool: 获取天气信息（需要知道用户在哪个城市）
+【可用工具】（根据实际需求自主选择调用）
+- search_xhs_tool: 搜索小红书热门穿搭，获取灵感（当需要了解当前流行趋势时使用）
+- search_wardrobe_tool: 检索用户衣柜中的衣物（单品类）
+- search_wardrobe_batch_tool: 批量并行检索多个品类（推荐！）。当你需要为用户搭配完整穿搭时使用，一次调用即可获取上衣+裤子+鞋子等多个品类的衣物。
+- get_current_time: 获取当前时间（当用户说"明天"、"后天"等相对时间时使用）
+- calculate_future_date: 计算未来日期（当用户说"后天"、"一周后"等需要计算具体日期时使用）
+- search_city: 搜索城市信息（当用户提到某个地点/城市，需要获取该城市详细信息时使用）
+- get_weather_info: 获取指定城市的当前天气和未来天气预报
+- get_weather_with_suggestion: 获取指定城市的天气+穿搭建议（需要先获取城市信息）
+- get_weather_forecast: 获取未来几天的天气预报（当需要了解多日天气趋势时使用）
 - update_preference_tool: 当用户表达喜好/厌恶时，记录到偏好中
+- get_user_preference_tool: 查询用户的偏好
 
-【重要规则】
-- 先了解用户需求，再决定调用哪些工具
-- 可以一次调用多个工具收集信息
-- 收集完信息后，给出具体的穿搭建议
-- 如果衣柜缺少某品类，明确告知用户
+【重要原则】
+- 你可以根据用户需求自主决定调用哪些工具，以及调用顺序
+- 工具调用是动态的，不需要按照固定流程
+- 当衣柜检索结果为空时，可以调用小红书搜索获取灵感
+- 当需要知道具体时间或地点时，主动调用相关工具
+- 推荐使用 search_wardrobe_batch_tool 一次性获取多品类衣物
 
-【回复要求】
-- 语气专业但亲切
-- 给出具体的搭配方案
-- 指出每件衣服的特点和搭配理由"""
+【回复格式要求】（必须严格遵守）
+你必须直接给出穿搭方案，不要返回任何流程说明、工具调用指令或待填充的模板。
+
+输出格式如下（每项都必须包含）：
+【上衣】: 具体款式+颜色+材质，例如：白色棉质衬衫
+【下装】: 具体款式+颜色+材质，例如：深蓝色直筒牛仔裤
+【鞋子】: 具体款式+颜色，例如：黑色皮质乐福鞋
+【配饰】（可选）: 具体配饰，例如：银色手表
+【搭配理由】: 简短说明搭配思路（颜色协调、风格统一、场合合适等）
+
+禁止返回以下内容：
+- ❌ "待触发流程说明"
+- ❌ "服务流程声明"
+- ❌ 工具调用指令（如"接下来我将调用..."）
+- ❌ 任何形式的模板占位符（如"请告诉用户..."、"待填充"等）
+
+你只能返回上述格式的具体穿搭方案，不要返回其他内容。"""
 
 
 # ========== 节点1: 路由节点 (Router) ==========
-def router_node(state: GraphState) -> Dict[str, Any]:
+async def router_node(state: GraphState) -> Dict[str, Any]:
     """
     路由节点 - 识别用户意图并决定后续处理方式
-    
+
     使用 Pydantic Schema 进行结构化输出。
-    
+
     Args:
         state: GraphState，包含 messages
-        
+
     Returns:
         更新后的状态，包含 current_intent
     """
     messages = state.get("messages", [])
-    
+
     # 获取最后一条人类消息
     user_message = None
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             user_message = msg.content
             break
-    
+
     if not user_message:
         # 没有人类消息，使用默认意图
         return {"current_intent": "chat"}
-    
+
     # 构建提示词
     prompt_text = build_intent_recognition_prompt(
         user_query=user_message,
         has_image=False,  # TODO: 处理图片
         conversation_history=[]
     )
-    
-    # 调用 LLM 进行意图识别
-    llm = get_llm()
-    
+
+    # 调用异步 LLM 进行意图识别
+    llm = get_async_llm()
+
     if llm is None:
         # Mock 模式
         intent = _mock_route_intent(user_message)
         return {"current_intent": intent}
-    
+
     try:
         # 使用 Pydantic Schema 进行结构化输出
         llm_with_structured = llm.with_structured_output(RouterOutput)
-        
-        response = llm_with_structured.invoke([
+
+        response = await llm_with_structured.ainvoke([
             SystemMessage(content=prompt_text)
         ])
-        
+
         intent = response.intent.value if hasattr(response.intent, 'value') else response.intent
-        
+
         print(f"[Router] 识别意图: {intent}, 理由: {response.reason}")
-        
+
         return {"current_intent": intent}
-        
+
     except Exception as e:
         print(f"[Router] 意图识别失败: {e}")
         return {"current_intent": "chat"}
@@ -143,30 +161,30 @@ def _mock_route_intent(user_message: str) -> str:
 
 
 # ========== 节点2: 直接处理节点 (Direct Action) ==========
-def direct_action_node(state: GraphState) -> Dict[str, Any]:
+async def direct_action_node(state: GraphState) -> Dict[str, Any]:
     """
     直接处理节点 - 处理 wardrobe_add、update_preference、chat 意图
-    
+
     不需要复杂的工具调用，直接生成回复。
-    
+
     Args:
         state: GraphState
-        
+
     Returns:
         更新后的状态，包含新的 AI 消息
     """
     current_intent = state.get("current_intent", "chat")
     messages = state.get("messages", [])
-    
+
     # 获取用户消息
     user_message = ""
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             user_message = msg.content
             break
-    
-    llm = get_llm()
-    
+
+    llm = get_async_llm()
+
     if llm is None:
         # Mock 模式
         response_content = _mock_direct_response(current_intent, user_message)
@@ -174,17 +192,17 @@ def direct_action_node(state: GraphState) -> Dict[str, Any]:
         try:
             # 构建提示词
             prompt = _build_direct_action_prompt(current_intent, user_message)
-            
-            response = llm.invoke([
+
+            response = await llm.ainvoke([
                 SystemMessage(content="你是一个友好的穿搭助手，请简洁回复用户。"),
                 HumanMessage(content=prompt)
             ])
             response_content = response.content
-            
+
         except Exception as e:
             print(f"[DirectAction] 生成回复失败: {e}")
             response_content = _mock_direct_response(current_intent, user_message)
-    
+
     # 返回 AI 消息
     return {
         "messages": [AIMessage(content=response_content)]
@@ -225,73 +243,74 @@ def _mock_direct_response(intent: str, user_message: str) -> str:
 
 
 # ========== 节点3: 穿搭设计师节点 (Stylist Agent) ==========
-def stylist_agent_node(state: GraphState) -> Dict[str, Any]:
+async def stylist_agent_node(state: GraphState) -> Dict[str, Any]:
     """
     核心穿搭生成 Agent - 使用 ReAct 模式
-    
+
     绑定工具，让 LLM 自行决定调用哪些工具来收集信息，
     直到收集到足够信息后生成穿搭建议。
-    
+
     Args:
         state: GraphState
-        
+
     Returns:
         更新后的状态，包含 AI 消息（可能包含 tool_calls）
     """
     messages = state.get("messages", [])
     user_preferences = state.get("user_preferences", {})
-    
+
     # 获取用户消息
     user_message = ""
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             user_message = msg.content
             break
-    
-    llm = get_llm()
-    
+
+    llm = get_async_llm()
+
     if llm is None:
         # Mock 模式
         response_content = _mock_stylist_response(user_message, user_preferences)
         return {"messages": [AIMessage(content=response_content)]}
-    
+
     try:
         # 合并所有工具
         all_tools = [
             search_xhs_tool,
             search_wardrobe_tool,
+            search_wardrobe_batch_tool,  # 新增：批量并行检索
             update_preference_tool,
             get_user_preference_tool,
         ] + AGENT_WEATHER_TOOLS
-        
+
         # 绑定工具到 LLM
         llm_with_tools = llm.bind_tools(all_tools)
-        
+
         # 构建上下文
         context_messages = [
             SystemMessage(content=STYLIST_SYSTEM_PROMPT)
         ]
-        
+
         # 如果有用户偏好，添加到上下文
         if user_preferences:
             prefs_str = ", ".join([f"{k}={v}" for k, v in user_preferences.items()])
             context_messages.append(SystemMessage(
                 content=f"【用户偏好】{prefs_str}"
             ))
-        
+
         # 添加历史消息
         context_messages.extend(messages)
-        
-        # 调用 LLM（可能返回 tool_calls 或直接回复）
-        response = llm_with_tools.invoke(context_messages)
-        
+
+        # 异步调用 LLM（可能返回 tool_calls 或直接回复）
+        response = await llm_with_tools.ainvoke(context_messages)
+
         print(f"[Stylist] 响应类型: {type(response).__name__}")
         if hasattr(response, 'tool_calls') and response.tool_calls:
             print(f"[Stylist] 调用工具: {[tc['name'] for tc in response.tool_calls]}")
-        
+
         # 返回响应（包含 tool_calls）
         return {"messages": [response]}
-        
+
     except Exception as e:
         print(f"[Stylist] 生成失败: {e}")
         return {
@@ -316,22 +335,22 @@ def _mock_stylist_response(user_message: str, user_preferences: str) -> str:
 
 
 # ========== 节点4: 评估节点 (Critic Agent) ==========
-def critic_agent_node(state: GraphState) -> Dict[str, Any]:
+async def critic_agent_node(state: GraphState) -> Dict[str, Any]:
     """
     评估节点 - 审核穿搭方案
-    
+
     读取生成的穿搭建议，使用 Pydantic Schema 进行结构化评估。
     如果不通过，返回包含修改意见的消息，触发重试。
-    
+
     Args:
         state: GraphState
-        
+
     Returns:
         更新后的状态，可能包含新的修改指令消息
     """
     messages = state.get("messages", [])
     iterations = state.get("iterations", 0)
-    
+
     # 获取最后一条 AI 消息（穿搭建议）
     outfit_proposal = ""
     for msg in reversed(messages):
@@ -340,16 +359,16 @@ def critic_agent_node(state: GraphState) -> Dict[str, Any]:
             if not hasattr(msg, 'tool_calls') or not msg.tool_calls:
                 outfit_proposal = msg.content
                 break
-    
+
     if not outfit_proposal:
         # 没有穿搭建议，跳过评估
         return {"messages": [], "iterations": iterations}
-    
+
     # 获取用户偏好
     user_preferences = state.get("user_preferences", {})
-    
-    llm = get_llm()
-    
+
+    llm = get_async_llm()
+
     if llm is None:
         # Mock 模式
         is_pass, feedback = _mock_critic_evaluate(iterations)
@@ -357,27 +376,27 @@ def critic_agent_node(state: GraphState) -> Dict[str, Any]:
         try:
             # 构建评估提示词
             prompt = _build_critic_prompt(outfit_proposal, user_preferences)
-            
+
             # 使用 Pydantic Schema 进行结构化输出
             llm_with_structured = llm.with_structured_output(CriticOutput)
-            
-            response = llm_with_structured.invoke([
+
+            response = await llm_with_structured.ainvoke([
                 SystemMessage(content="你是一位严格的时尚评论家，请评估以下穿搭方案。"),
                 HumanMessage(content=prompt)
             ])
-            
+
             is_pass = response.is_pass
             feedback = response.feedback_reason
-            
+
             print(f"[Critic] 评估结果: {'通过' if is_pass else '需修改'}")
             print(f"[Critic] 反馈: {feedback}")
-            
+
         except Exception as e:
             print(f"[Critic] 评估失败: {e}")
             # 评估失败时默认通过
             is_pass = True
             feedback = ""
-    
+
     if is_pass:
         # 评估通过，不做修改
         return {"messages": [], "iterations": iterations}
@@ -387,7 +406,7 @@ def critic_agent_node(state: GraphState) -> Dict[str, Any]:
         feedback_msg = HumanMessage(
             content=f"【修改意见】上一轮穿搭方案需要修改：{feedback}\n请重新生成穿搭建议。"
         )
-        
+
         return {
             "messages": [feedback_msg],
             "iterations": iterations
@@ -426,80 +445,3 @@ def _mock_critic_evaluate(iterations: int) -> tuple:
         return True, ""
 
 
-# ========== 工具执行节点 ==========
-def tool_executor_node(state: GraphState) -> Dict[str, Any]:
-    """
-    工具执行节点 - 执行 Stylist Agent 返回的 tool_calls
-    
-    当 Stylist Agent 返回 tool_calls 时，LangGraph 会自动调用此节点
-    执行工具并将结果添加到消息中。
-    
-    Args:
-        state: GraphState
-        
-    Returns:
-        更新后的状态，包含工具执行结果
-    """
-    messages = state.get("messages", [])
-    
-    # 获取最后一条 AI 消息
-    last_ai_msg = None
-    for msg in reversed(messages):
-        if isinstance(msg, AIMessage):
-            last_ai_msg = msg
-            break
-    
-    if not last_ai_msg or not hasattr(last_ai_msg, 'tool_calls') or not last_ai_msg.tool_calls:
-        # 没有工具调用，直接返回
-        return {}
-    
-    # 合并所有工具
-    all_tools = {
-        search_xhs_tool.name: search_xhs_tool,
-        search_wardrobe_tool.name: search_wardrobe_tool,
-        update_preference_tool.name: update_preference_tool,
-        get_user_preference_tool.name: get_user_preference_tool,
-    }
-    for wt in AGENT_WEATHER_TOOLS:
-        all_tools[wt.name] = wt
-    
-    # 执行工具调用
-    tool_results = []
-    
-    for tool_call in last_ai_msg.tool_calls:
-        tool_name = tool_call.get("name")
-        tool_args = tool_call.get("args", {})
-        
-        print(f"[ToolExecutor] 执行工具: {tool_name}")
-        print(f"[ToolExecutor] 参数: {tool_args}")
-        
-        tool_func = all_tools.get(tool_name)
-        
-        if tool_func:
-            try:
-                result = tool_func.invoke(tool_args)
-                print(f"[ToolExecutor] 结果: {str(result)[:100]}...")
-                tool_results.append({
-                    "tool_call_id": tool_call.get("id"),
-                    "result": str(result)
-                })
-            except Exception as e:
-                print(f"[ToolExecutor] 工具执行失败: {e}")
-                tool_results.append({
-                    "tool_call_id": tool_call.get("id"),
-                    "result": f"工具执行失败: {str(e)}"
-                })
-        else:
-            print(f"[ToolExecutor] 未找到工具: {tool_name}")
-    
-    # 返回工具结果（作为新的 AI 消息）
-    if tool_results:
-        result_contents = []
-        for tr in tool_results:
-            result_contents.append(tr["result"])
-        
-        return {
-            "messages": [AIMessage(content="\n\n".join(result_contents))]
-        }
-    
-    return {}
